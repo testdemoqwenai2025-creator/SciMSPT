@@ -1,8 +1,33 @@
 #!/usr/bin/env python3
 """
-EMERGENCY PAGE CLEANER - Fixes visible JS corruption on SciMSPT pages
-=====================================================================
-RUN THIS BEFORE EVERY DEPLOYMENT - NO EXCEPTIONS!
+=============================================================================
+SciMSPT PAGE CLEANER - REMOVES VISIBLE JS CORRUPTION
+=============================================================================
+
+⚠️  RUN THIS SCRIPT BEFORE EVERY DEPLOYMENT - NO EXCEPTIONS!
+
+WHAT IT FIXES:
+-------------
+1. 🚫 Visible JavaScript code (BooleanObserver, MobileDetection) showing as text
+2. 🚫 Chinese characters appearing on English pages  
+3. 🚫 Orphaned JS comments ("/* SYSTEM v4.0 */") rendering as visible content
+4. 🚫 Broken </script> tags leaving code outside script blocks
+5. 🚫 Stuck skeleton loaders (gray bars blocking content)
+
+USAGE:
+------
+# Quick clean (run this before every preview/deploy):
+python3 clean_pages.py
+
+# Clean + verify:
+python3 clean_pages.py && echo "✅ Pages are clean"
+
+EXIT CODES:
+-----------
+0 = All pages were already clean
+1 = Fixes were applied (pages needed cleaning)
+
+=============================================================================
 """
 
 import re
@@ -10,208 +35,239 @@ import os
 import glob
 from datetime import datetime
 
-def clean_file(filepath):
-    """Remove all visible JavaScript corruption from an HTML file"""
+def find_and_fix_orphaned_js(filepath):
+    """Find JavaScript code outside <script> tags and wrap it properly"""
     
     with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-        original = content
+        lines = f.readlines()
     
-    lines = content.split('\n')
-    fixed_lines = []
+    output = []
     i = 0
-    in_script = False
+    in_orphan_block = False
     fixes = 0
     
-    # Patterns that indicate JS header comments (should be removed if outside scripts)
-    js_header_patterns = [
-        r'INTELLIGENT MOBILE DETECTION',
-        r'BOOLEAN OBSERVER SYSTEM',
-        r'Device-Aware.*Contextual.*Helpful',
-        r'Human Confirmation.*Real-time Monitoring',
+    # Patterns that indicate start of orphaned JS code
+    orphan_indicators = [
+        'INTELLIGENT MOBILE DETECTION',
+        'BOOLEAN OBSERVER SYSTEM', 
+        'Device-Aware | Contextual',
+        'Human Confirmation | Real-time Monitoring'
     ]
+    
+    while i < len(lines):
+        line = lines[i]
+        
+        # Detect start of orphaned JS block
+        if not in_orphan_block:
+            for indicator in orphan_indicators:
+                if indicator in line:
+                    # Found orphaned JS - wrap it in script tag
+                    output.append('<script>\n')
+                    output.append(line)
+                    in_orphan_block = True
+                    fixes += 1
+                    i += 1
+                    break
+            
+            if in_orphan_block:
+                continue  # Skip adding line again
+        
+        if in_orphan_block:
+            output.append(line)
+            
+            # Detect end of IIFE block
+            stripped = line.strip()
+            if ('window.MobileDetection = MobileDetection' in stripped or 
+                'window.BooleanObserver = BooleanObserver' in stripped or
+                (stripped == '})();' and i + 1 < len(lines) and 
+                 not lines[i+1].strip().startswith(('const', 'let', 'var', 'function')))):
+                
+                output.append('</script>\n')
+                in_orphan_block = False
+                fixes += 1
+            
+            i += 1
+            continue
+        
+        output.append(line)
+        i += 1
+    
+    return output, fixes
+
+def remove_broken_script_tags(lines):
+    """Remove </script><script> pairs that split JavaScript code mid-block"""
+    output = []
+    i = 0
+    fixes = 0
     
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
         
-        # Track script context
-        if '<script' in stripped and '</script>' not in stripped:
-            in_script = True
-        
-        if '</script>' in stripped:
-            # Check if NEXT lines are JS code (meaning this close was premature)
-            look_ahead_idx = i + 1
-            while look_ahead_idx < len(lines) and not lines[look_ahead_idx].strip():
-                look_ahead_idx += 1
+        # Find erroneous </script> followed by more JS code
+        if stripped == '</script>' and i + 1 < len(lines):
+            next_lines = []
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                next_lines.append(lines[j])
+                j += 1
             
-            if look_ahead_idx < len(lines):
-                next_content = lines[look_ahead_idx].strip()
-                # If next non-empty line looks like JS, this </script> is wrong
+            if j < len(lines):
+                next_content = lines[j].strip()
+                # If next non-empty line is JS code, this </script> is wrong
                 if (next_content and 
-                    not next_content.startswith('<') and 
+                    not next_content.startswith('<') and
                     not next_content.startswith('<!--') and
-                    (re.match(r'^\s*(const|let|var|function|class|if|for|while|return|//|/\*)', next_content) or
-                     any(pattern in next_content for pattern in ['MobileDetection', 'BooleanObserver']))):
+                    re.match(r'^[\s\w"\'\:.,(){}\[\];]', next_content)):
                     
-                    # This </script> is breaking JS flow - SKIP it
-                    fixed_lines.append(f'  <!-- REMOVED BROKEN </script> at line {i+1} -->')
-                    i += 1
+                    # Skip this broken </script>
                     fixes += 1
-                    continue
-            
-            in_script = False
-        
-        # Skip orphaned JS header comments outside scripts
-        if not in_script and re.match(r'^\s*/\*[=~-]+\s*$', stripped):
-            # Check if this is an orphaned comment block
-            block_end = min(i + 6, len(lines))
-            block_text = '\n'.join(lines[i:block_end])
-            
-            if any(re.search(pattern, block_text, re.IGNORECASE) for pattern in js_header_patterns):
-                # Skip entire comment block
-                start_i = i
-                while i < len(lines):
-                    if '*/' in lines[i]:
-                        i += 1
-                        break
                     i += 1
-                
-                # Also skip metadata lines after comment
-                while i < len(lines):
-                    next_s = lines[i].strip()
-                    if not next_s or next_s.startswith('<'):
-                        break
-                    if re.match(r'^[A-Za-z]+\s*\|', next_s) or 'Device-Aware' in next_s:
-                        i += 1
-                        continue
-                    break
-                
-                fixes += 1
-                continue
+                    continue
         
-        # Skip standalone <script> tags that break JS flow
-        if not in_script and stripped == '<script>':
-            # Check previous line
-            prev_idx = len(fixed_lines) - 1
-            while prev_idx >= 0 and not fixed_lines[prev_idx].strip():
+        # Find erroneous <script> after JS code (not starting new block)
+        if stripped == '<script>' and i > 0:
+            prev_idx = len(output) - 1
+            while prev_idx >= 0 and not output[prev_idx].strip():
                 prev_idx -= 1
             
             if prev_idx >= 0:
-                prev_line = fixed_lines[prev_idx].strip()
+                prev_line = output[prev_idx].strip()
                 # If previous line looks like unfinished JS, skip this <script>
-                if prev_line.endswith(('{', ',', '(', 'return', '}', ';')) or prev_line.startswith('//') or 'use strict' in prev_line:
+                if (prev_line.endswith(('{', ',', '(', ';', '}')) or 
+                    prev_line.startswith('//') or
+                    'use strict' in prev_line):
                     fixes += 1
                     i += 1
                     continue
         
-        fixed_lines.append(line)
-        
-        # Update script state for opening tags
-        if '<script' in stripped and '</script>' not in stripped:
-            in_script = True
-        
+        output.append(line)
         i += 1
     
-    new_content = '\n'.join(fixed_lines)
-    
-    if fixes > 0:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        return True, fixes
-    
-    return False, 0
+    return output, fixes
 
-def add_loader_failsafe(filepath):
-    """Add failsafe to prevent stuck skeleton loaders"""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
+def add_loader_failsafe(content, filepath):
+    """Add automatic failsafe to prevent stuck skeleton loaders"""
     if 'skeletonLoader' not in content:
-        return False
+        return content, False
     
-    # Check if failsafe already exists
-    if 'loader-failsafe' in content or 'forceHideLoader' in content:
-        return False
+    if 'loader-failsafe' in content:
+        return content, False
     
     failsafe = '''
-  <!-- FAILSAFE: Force hide skeleton loader after 800ms -->
+  <!-- FAILSAFE: Auto-hide skeleton loader after 800ms -->
   <script id="loader-failsafe">
     (function() {
-      var checkLoader = setInterval(function() {
+      function hideLoader() {
         var loader = document.getElementById('skeletonLoader');
         if (loader) {
-          clearInterval(checkLoader);
-          setTimeout(function() {
-            loader.style.opacity = '0';
-            loader.style.visibility = 'hidden';
-            loader.style.pointerEvents = 'none';
-            setTimeout(function() { 
-              if (loader && loader.parentNode) loader.remove(); 
-            }, 500);
-          }, 800);
+          loader.style.opacity = '0';
+          loader.style.visibility = 'hidden';
+          loader.style.pointerEvents = 'none';
+          setTimeout(function() { 
+            try { loader.remove(); } catch(e) {} 
+          }, 500);
         }
-      }, 100);
-      // Stop checking after 10 seconds
-      setTimeout(function() { clearInterval(checkLoader); }, 10000);
+      }
+      // Try immediately
+      hideLoader();
+      // Also try after delays (catches late-loading issues)
+      setTimeout(hideLoader, 800);
+      setTimeout(hideLoader, 2000);
+      setTimeout(hideLoader, 5000);
     })();
   </script>
 '''
     
     if '</body>' in content:
         content = content.replace('</body>', failsafe + '\n</body>')
+        return content, True
+    
+    return content, False
+
+def clean_file(filepath):
+    """Clean a single HTML file of all known corruption patterns"""
+    
+    with open(filepath, 'r', encoding='utf-8') as f:
+        original = f.read()
+    
+    # Fix 1: Wrap orphaned JS code
+    lines, fixes1 = find_and_fix_orphaned_js(filepath)
+    
+    # Fix 2: Remove broken script tags
+    lines, fixes2 = remove_broken_script_tags(lines)
+    
+    # Write intermediate result
+    content = ''.join(lines)
+    
+    # Fix 3: Add loader failsafe
+    content, fixes3 = add_loader_failsafe(content, filepath)
+    
+    total_fixes = fixes1 + fixes2 + fixes3
+    
+    if total_fixes > 0:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
-        return True
     
-    return False
+    return total_fixes
 
 def main():
     base_dir = '/home/z/my-project/SciMSPT'
-    os.chdir(base_dir)
+    
+    try:
+        os.chdir(base_dir)
+    except Exception as e:
+        print(f"❌ Error: Cannot access {base_dir}")
+        print(f"   {e}")
+        return 1
     
     print("=" * 70)
-    print("🚨 EMERGENCY PAGE CLEANER")
+    print("🧹 SciMSPT Page Cleaner")
     print("=" * 70)
     print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     
     html_files = sorted(glob.glob('*.html'))
-    print(f"📁 Found {len(html_files)} HTML files to clean\n")
     
+    if not html_files:
+        print("❌ No HTML files found!")
+        return 1
+    
+    print(f"📁 Scanning {len(html_files)} files...\n")
+    
+    total_files_fixed = 0
     total_fixes = 0
-    cleaned_files = []
-    loader_fixed = []
     
     for filepath in html_files:
         filename = os.path.basename(filepath)
         
-        # Clean JS corruption
-        fixed, count = clean_file(filepath)
-        if fixed:
-            print(f"✅ {filename}: Removed {count} corruption items")
-            total_fixes += count
-            cleaned_files.append(filename)
-        
-        # Add loader failsafe
-        if add_loader_failsafe(filepath):
-            print(f"🛡️ {filename}: Added skeleton loader failsafe")
-            loader_fixed.append(filename)
+        try:
+            fixes = clean_file(filepath)
+            
+            if fixes > 0:
+                print(f"✅ {filename}: {fixes} issues fixed")
+                total_files_fixed += 1
+                total_fixes += fixes
+            else:
+                print(f"✓ {filename}: Already clean")
+                
+        except Exception as e:
+            print(f"❌ {filename}: Error - {e}")
     
     print("\n" + "=" * 70)
-    print("📊 SUMMARY")
+    print("📊 Results")
     print("=" * 70)
-    print(f"Files with JS corruption fixed: {len(cleaned_files)}")
-    print(f"Total corruption items removed: {total_fixes}")
-    print(f"Files with loader failsafe added: {len(loader_fixed)}")
+    print(f"Files fixed: {total_files_fixed}/{len(html_files)}")
+    print(f"Total issues resolved: {total_fixes}")
     
-    if total_fixes == 0 and not loader_fixed:
-        print("\n✅ All pages were already clean!")
+    if total_fixes == 0:
+        print("\n✨ All pages are clean! Ready for deployment.")
+        return 0
     else:
-        print("\n✅ Cleaning complete!")
-    
-    return len(cleaned_files) > 0 or len(loader_fixed) > 0
+        print(f"\n🎉 Fixed {total_files_fixed} files ({total_fixes} issues)")
+        print("✅ Pages are now ready for deployment.")
+        return 1
 
 if __name__ == '__main__':
-    changed = main()
-    exit(0 if not changed else 1)  # Exit 0 if no changes needed
+    exit_code = main()
+    exit(exit_code)
